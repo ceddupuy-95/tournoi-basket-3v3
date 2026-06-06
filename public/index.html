@@ -228,21 +228,85 @@ function mutate(fn){ fn(state); render(); scheduleSync(); }
 function genId(){ return Math.random().toString(36).slice(2,9); }
 function shuffle(arr){ const a=[...arr]; for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];} return a; }
 
+// Répartit les équipes dans les poules en MINIMISANT le regroupement de
+// sous-équipes d'une même classe. Stratégie : un tirage initial intelligent,
+// puis une optimisation par échanges entre poules (recherche locale), répétée
+// sur plusieurs tirages aléatoires pour retenir le meilleur résultat.
 function distributeTeams(teams,poolCount){
   const total=teams.length,base=Math.floor(total/poolCount),extras=total%poolCount;
-  const pools=Array.from({length:poolCount},(_,i)=>({id:genId(),name:`Poule ${String.fromCharCode(65+i)}`,teams:[],capacity:base+(i<extras?1:0)}));
-  const byClasse={};
-  teams.forEach(t=>{ if(!byClasse[t.classeId]) byClasse[t.classeId]=[]; byClasse[t.classeId].push(t); });
-  const groups=shuffle(Object.values(byClasse)).sort((a,b)=>b.length-a.length);
-  const queue=[]; const maxLen=Math.max(...groups.map(g=>g.length));
-  for(let r=0;r<maxLen;r++) groups.forEach(g=>{ if(g[r]) queue.push(g[r]); });
-  queue.forEach(team=>{
-    const avail=pools.filter(p=>p.teams.length<p.capacity); if(!avail.length) return;
-    avail.sort((a,b)=>{ const sA=a.teams.filter(t=>t.classeId===team.classeId).length,sB=b.teams.filter(t=>t.classeId===team.classeId).length; return sA!==sB?sA-sB:a.teams.length-b.teams.length; });
-    avail[0].teams.push(team);
+  // Capacité de chaque poule (les premières reçoivent l'équipe supplémentaire).
+  const capacities=Array.from({length:poolCount},(_,i)=>base+(i<extras?1:0));
+
+  // Coût d'une répartition = somme, pour chaque poule et chaque classe, du
+  // nombre de paires de même classe C(n,2). Plus c'est bas, mieux les
+  // sous-équipes sont séparées ET réparties de façon équilibrée entre poules.
+  function cost(assign){
+    let c=0;
+    for(const pool of assign){
+      const counts={};
+      for(const t of pool) counts[t.classeId]=(counts[t.classeId]||0)+1;
+      for(const k in counts){ const n=counts[k]; c+=n*(n-1)/2; }
+    }
+    return c;
+  }
+
+  // Tirage initial : on étale les sous-équipes par « rang » de classe, puis on
+  // place chaque équipe dans la poule (avec de la place) qui contient le moins
+  // d'équipes de sa classe — l'ordre aléatoire évite un biais systématique.
+  function seed(){
+    const byClasse={};
+    teams.forEach(t=>{ if(!byClasse[t.classeId]) byClasse[t.classeId]=[]; byClasse[t.classeId].push(t); });
+    const groups=shuffle(Object.values(byClasse)).sort((a,b)=>b.length-a.length);
+    const maxLen=Math.max(...groups.map(g=>g.length));
+    const queue=[];
+    for(let r=0;r<maxLen;r++) groups.forEach(g=>{ if(g[r]) queue.push(g[r]); });
+    const pools=Array.from({length:poolCount},()=>[]);
+    queue.forEach(team=>{
+      const order=shuffle(pools.map((_,i)=>i)).filter(i=>pools[i].length<capacities[i]);
+      if(!order.length) return;
+      order.sort((x,y)=>{
+        const sx=pools[x].filter(t=>t.classeId===team.classeId).length;
+        const sy=pools[y].filter(t=>t.classeId===team.classeId).length;
+        return sx!==sy ? sx-sy : pools[x].length-pools[y].length;
+      });
+      pools[order[0]].push(team);
+    });
+    return pools;
+  }
+
+  // Recherche locale : on tente des échanges d'équipes entre deux poules ; on
+  // garde l'échange dès qu'il réduit le coût (la taille des poules est préservée).
+  function optimize(pools){
+    let c=cost(pools),improved=true;
+    while(improved && c>0){
+      improved=false;
+      for(let i=0;i<poolCount && !improved;i++)
+      for(let j=i+1;j<poolCount && !improved;j++)
+      for(let a=0;a<pools[i].length && !improved;a++)
+      for(let b=0;b<pools[j].length && !improved;b++){
+        const ta=pools[i][a],tb=pools[j][b];
+        if(ta.classeId===tb.classeId) continue;
+        pools[i][a]=tb; pools[j][b]=ta;
+        const nc=cost(pools);
+        if(nc<c){ c=nc; improved=true; }
+        else { pools[i][a]=ta; pools[j][b]=tb; }
+      }
+    }
+    return c;
+  }
+
+  let best=null,bestCost=Infinity;
+  for(let r=0;r<60;r++){
+    const pools=seed();
+    const c=optimize(pools);
+    if(c<bestCost){ bestCost=c; best=pools.map(p=>[...p]); }
+    if(bestCost===0) break; // séparation parfaite atteinte
+  }
+
+  return best.map((ts,i)=>{
+    const pairs=[]; for(let x=0;x<ts.length;x++) for(let y=x+1;y<ts.length;y++) pairs.push([ts[x],ts[y]]);
+    return { id:genId(), name:`Poule ${String.fromCharCode(65+i)}`, teams:ts, matches:scheduleWithRest(pairs) };
   });
-  pools.forEach(pool=>{ const ts=pool.teams,pairs=[]; for(let i=0;i<ts.length;i++) for(let j=i+1;j<ts.length;j++) pairs.push([ts[i],ts[j]]); pool.matches=scheduleWithRest(pairs); delete pool.capacity; });
-  return pools;
 }
 
 function scheduleWithRest(pairs){
@@ -444,7 +508,10 @@ function renderPools(){
   return `
   <div style="display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:1rem;margin-bottom:1.5rem">
     <div><h2 class="section-title">Phase de <span>Poules</span></h2><p class="section-sub">${played}/${total} matchs joués${allDone?' · ✅ Phase terminée !':''}</p></div>
-    <button class="btn btn-primary" ${allDone?'':'disabled'} onclick="goConsolation()">🥈 Petites finales →</button>
+    <div style="display:flex;gap:.5rem;flex-wrap:wrap">
+      <button class="btn btn-secondary" onclick="redrawPools()">🔄 Re-tirer les poules</button>
+      <button class="btn btn-primary" ${allDone?'':'disabled'} onclick="goConsolation()">🥈 Petites finales →</button>
+    </div>
   </div>
   <div style="background:var(--dark3);border-radius:99px;height:8px;margin-bottom:2rem;overflow:hidden"><div style="width:${pct}%;height:100%;background:var(--orange);border-radius:99px;transition:width .4s"></div></div>
   <div class="tabs">${pools.map((p,i)=>`<button class="tab${state.activePoolTab===i?' active':''}" onclick="setPoolTab(${i})">${p.name} ${p.matches.every(m=>m.played)?'<span class="badge badge-green">✓</span>':'<span class="badge badge-muted">'+p.matches.filter(m=>m.played).length+'/'+p.matches.length+'</span>'}</button>`).join('')}</div>
@@ -601,6 +668,16 @@ function genABCD(){
 function startTournament(){
   if(state.teams.length<state.config.poolCount*2) return;
   mutate(s=>{ s.pools=distributeTeams(s.teams,s.config.poolCount); s.activePoolTab=0; s.phase='pools'; });
+}
+
+// Génère une nouvelle répartition des poules (utile si le tirage ne convient pas).
+function redrawPools(){
+  const anyPlayed=state.pools.some(p=>p.matches.some(m=>m.played));
+  const msg=anyPlayed
+    ? 'Re-tirer les poules ? Les scores déjà saisis seront effacés.'
+    : 'Re-tirer les poules ? Une nouvelle répartition sera générée.';
+  if(!confirm(msg)) return;
+  mutate(s=>{ s.pools=distributeTeams(s.teams,s.config.poolCount); s.activePoolTab=0; });
 }
 
 // ── Poules ────────────────────────────────────────────────────
